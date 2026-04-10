@@ -1,6 +1,6 @@
 /**
  * Debug WebSocket connection to OpenClaw Gateway
- * Logs all messages to find the correct auth flow
+ * Tries multiple auth frame formats to find the correct one
  */
 import 'dotenv/config'
 import WebSocket from 'ws'
@@ -8,79 +8,93 @@ import WebSocket from 'ws'
 const url = process.env.ALLYCLAW_GATEWAY_URL!.replace(/^http/, 'ws')
 const token = process.env.ALLYCLAW_TOKEN!
 
-console.log('Connecting to:', url)
-const ws = new WebSocket(url)
+interface AuthFormat {
+  name: string
+  build: (nonce: string) => unknown
+}
 
-ws.on('open', () => {
-  console.log('[open] Connected')
-})
+const formats: AuthFormat[] = [
+  {
+    name: 'Format A: {type:"request", id, method:"connect.auth", params:{token,nonce}}',
+    build: (nonce) => ({ type: 'request', id: 1, method: 'connect.auth', params: { token, nonce, clientName: 'allyclaw-agent', mode: 'webchat' } }),
+  },
+  {
+    name: 'Format B: {id, method:"connect.auth", params:{token,nonce}}',
+    build: (nonce) => ({ id: 1, method: 'connect.auth', params: { token, nonce, clientName: 'allyclaw-agent', mode: 'webchat' } }),
+  },
+  {
+    name: 'Format C: {type:"connect.auth", token, nonce}',
+    build: (nonce) => ({ type: 'connect.auth', token, nonce, clientName: 'allyclaw-agent', mode: 'webchat' }),
+  },
+  {
+    name: 'Format D: {type:"request", id, method:"connect.response", params:{token,nonce}}',
+    build: (nonce) => ({ type: 'request', id: 1, method: 'connect.response', params: { token, nonce, clientName: 'allyclaw-agent', mode: 'webchat' } }),
+  },
+  {
+    name: 'Format E: {action:"auth", token, nonce}',
+    build: (nonce) => ({ action: 'auth', token, nonce }),
+  },
+  {
+    name: 'Format F: {type:"auth", payload:{token,nonce}}',
+    build: (nonce) => ({ type: 'auth', payload: { token, nonce, clientName: 'allyclaw-agent', mode: 'webchat' } }),
+  },
+  {
+    name: 'Format G: {type:"connect.response", token, nonce} (flat)',
+    build: (nonce) => ({ type: 'connect.response', token, nonce, clientName: 'allyclaw-agent', mode: 'webchat' }),
+  },
+  {
+    name: 'Format H: {type:"rpc", id, method:"connect.auth", params:{token,nonce}}',
+    build: (nonce) => ({ type: 'rpc', id: 1, method: 'connect.auth', params: { token, nonce } }),
+  },
+]
 
-ws.on('message', (data) => {
-  const raw = data.toString()
-  const msg = JSON.parse(raw)
-  console.log('[recv]', JSON.stringify(msg, null, 2))
+function tryFormat(fmt: AuthFormat): Promise<string> {
+  return new Promise((resolve) => {
+    const ws = new WebSocket(url)
+    let done = false
+    const timer = setTimeout(() => { if (!done) { done = true; ws.close(); resolve('TIMEOUT (no response)') } }, 5000)
 
-  // On challenge, try multiple auth formats
-  if (msg.event === 'connect.challenge') {
-    const nonce = msg.payload?.nonce
-
-    // Format 1: type-based
-    const auth1 = {
-      type: 'connect.response',
-      payload: {
-        token,
-        nonce,
-        clientName: 'allyclaw-agent',
-        clientVersion: '1.0.0',
-        mode: 'webchat',
+    ws.on('message', (data) => {
+      if (done) return
+      const msg = JSON.parse(data.toString())
+      if (msg.event === 'connect.challenge') {
+        const nonce = msg.payload?.nonce
+        const auth = fmt.build(nonce)
+        ws.send(JSON.stringify(auth))
+        return
       }
+      if (msg.event === 'hello') {
+        done = true; clearTimeout(timer); ws.close()
+        resolve('SUCCESS! Got hello: ' + JSON.stringify(msg).slice(0, 200))
+        return
+      }
+      // Any other message
+      done = true; clearTimeout(timer); ws.close()
+      resolve('Got: ' + JSON.stringify(msg).slice(0, 200))
+    })
+
+    ws.on('close', (code, reason) => {
+      if (!done) { done = true; clearTimeout(timer); resolve(`CLOSED: ${code} ${reason.toString()}`) }
+    })
+
+    ws.on('error', (err) => {
+      if (!done) { done = true; clearTimeout(timer); resolve('ERROR: ' + err.message) }
+    })
+  })
+}
+
+async function main() {
+  console.log('Testing auth formats against', url, '\n')
+  for (const fmt of formats) {
+    const result = await tryFormat(fmt)
+    const ok = result.startsWith('SUCCESS') ? '✅' : '❌'
+    console.log(`${ok} ${fmt.name}`)
+    console.log(`   → ${result}\n`)
+    if (result.startsWith('SUCCESS')) {
+      console.log('Found working format! Stopping.')
+      break
     }
-    console.log('[send] Format 1 (connect.response):', JSON.stringify(auth1))
-    ws.send(JSON.stringify(auth1))
   }
+}
 
-  // On hello, send a test RPC
-  if (msg.event === 'hello') {
-    console.log('[auth] SUCCESS - received hello!')
-    const rpc = { id: 1, method: 'health', params: {} }
-    console.log('[send] RPC:', JSON.stringify(rpc))
-    ws.send(JSON.stringify(rpc))
-  }
-
-  // On RPC response
-  if (msg.id === 1) {
-    console.log('[rpc] Got response, closing')
-    ws.close()
-  }
-})
-
-ws.on('error', (err) => {
-  console.error('[error]', err.message)
-})
-
-ws.on('close', (code, reason) => {
-  console.log('[close]', code, reason.toString())
-})
-
-// Timeout
-setTimeout(() => {
-  console.log('[timeout] No hello after 8s, trying other auth formats...')
-
-  // Try format 2: flat token
-  const auth2 = { type: 'auth', token }
-  console.log('[send] Format 2 (auth):', JSON.stringify(auth2))
-  ws.send(JSON.stringify(auth2))
-
-  setTimeout(() => {
-    // Try format 3: method-based
-    const auth3 = { method: 'auth', params: { token } }
-    console.log('[send] Format 3 (method auth):', JSON.stringify(auth3))
-    ws.send(JSON.stringify(auth3))
-  }, 2000)
-
-  setTimeout(() => {
-    console.log('[timeout] Giving up after 15s')
-    ws.close()
-    process.exit(0)
-  }, 7000)
-}, 8000)
+main().catch(console.error)
