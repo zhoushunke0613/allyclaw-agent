@@ -2,22 +2,20 @@
  * Allyclaw (OpenClaw) Gateway Client
  * Connects via WebSocket RPC to the OpenClaw gateway
  *
- * Auth flow:
+ * Protocol (from OpenClaw source):
  *   1. Connect WebSocket
- *   2. Receive connect.challenge { nonce }
- *   3. Reply with connect.auth { token, nonce, clientName, mode }
- *   4. Receive hello event → authenticated
- *   5. Send RPC requests
+ *   2. Receive event: { type:"event", event:"connect.challenge", payload:{ nonce } }
+ *   3. Send request: { type:"req", id, method:"connect", params:{ auth:{token}, client:{...}, role, scopes, ... } }
+ *   4. Receive hello response → authenticated
+ *   5. Send RPC: { type:"req", id, method:"...", params:{...} }
  */
 
 import WebSocket from 'ws'
+import { randomUUID } from 'crypto'
 
 export interface AllyclawConfig {
-  /** WebSocket URL, e.g. ws://localhost:12369 */
   gatewayUrl: string
-  /** Auth token from openclaw.json gateway.auth.token */
   token: string
-  /** Request timeout in ms (default: 15000) */
   timeout?: number
 }
 
@@ -33,8 +31,8 @@ export class AllyclawClient {
   }
 
   /**
-   * Open a WebSocket connection, complete challenge-response auth,
-   * then send an RPC request and return the result.
+   * Open a WebSocket, authenticate with challenge-response,
+   * then send an RPC and return the result.
    */
   private rpc<T>(method: string, params: unknown = {}): Promise<T> {
     return new Promise((resolve, reject) => {
@@ -42,134 +40,105 @@ export class AllyclawClient {
       const ws = new WebSocket(wsUrl)
       let settled = false
       let authenticated = false
-      let rpcId = 1
+      const connectId = randomUUID()
 
       const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true
-          ws.close()
-          reject(new Error(`RPC timeout after ${this.timeout}ms for method: ${method}`))
-        }
+        if (!settled) { settled = true; ws.close(); reject(new Error(`RPC timeout: ${method}`)) }
       }, this.timeout)
 
       const finish = (err: Error | null, result?: T) => {
         if (settled) return
-        settled = true
-        clearTimeout(timer)
-        if (err) reject(err)
-        else resolve(result as T)
+        settled = true; clearTimeout(timer)
+        if (err) reject(err); else resolve(result as T)
         ws.close()
       }
-
-      ws.on('open', () => {
-        // Wait for challenge from gateway
-      })
 
       ws.on('message', (data: WebSocket.Data) => {
         if (settled) return
         try {
           const msg = JSON.parse(data.toString())
 
-          // Step 1: Handle challenge → send auth
-          if (msg.event === 'connect.challenge' || msg.type === 'connect.challenge') {
-            const nonce = msg.payload?.nonce ?? msg.nonce
+          // Step 1: challenge → send connect request
+          if (msg.type === 'event' && msg.event === 'connect.challenge') {
+            const nonce = msg.payload?.nonce
             ws.send(JSON.stringify({
-              type: 'connect.auth',
-              token: this.token,
-              nonce,
-              clientName: 'allyclaw-agent',
-              clientVersion: '1.0.0',
-              mode: 'webchat',
+              type: 'req',
+              id: connectId,
+              method: 'connect',
+              params: {
+                minProtocol: 3,
+                maxProtocol: 3,
+                client: {
+                  id: 'allyclaw-agent',
+                  version: '1.0.0',
+                  platform: 'linux',
+                  mode: 'webchat',
+                  instanceId: randomUUID(),
+                },
+                caps: [],
+                auth: { token: this.token },
+                role: 'operator',
+                scopes: ['operator.admin', 'operator.read'],
+                nonce,
+              },
             }))
             return
           }
 
-          // Step 2: Hello → authenticated, now send RPC
-          if (msg.event === 'hello' || msg.type === 'hello') {
-            authenticated = true
-            ws.send(JSON.stringify({
-              id: rpcId,
-              method,
-              params,
-            }))
-            return
-          }
-
-          // Step 3: Handle RPC response
-          if (authenticated) {
-            // Skip other events (agent, chat, presence, etc.)
-            if (msg.event && msg.id === undefined) return
-
+          // Step 2: connect response (hello) → send actual RPC
+          if (msg.id === connectId) {
             if (msg.error) {
-              finish(new Error(`RPC error (${method}): ${msg.error.message || JSON.stringify(msg.error)}`))
-            } else {
-              finish(null, (msg.result ?? msg.data ?? msg) as T)
+              finish(new Error(`Connect failed: ${JSON.stringify(msg.error)}`))
+              return
             }
+            authenticated = true
+            const rpcId = randomUUID()
+            ws.send(JSON.stringify({ type: 'req', id: rpcId, method, params }))
+
+            // Now wait for the RPC response with this rpcId
+            const origHandler = ws.listeners('message')[0] as (...args: unknown[]) => void
+            ws.removeAllListeners('message')
+            ws.on('message', (d: WebSocket.Data) => {
+              if (settled) return
+              try {
+                const m = JSON.parse(d.toString())
+                // Skip events
+                if (m.type === 'event') return
+                if (m.id === rpcId) {
+                  if (m.error) finish(new Error(`RPC error (${method}): ${JSON.stringify(m.error)}`))
+                  else finish(null, (m.result ?? m) as T)
+                }
+              } catch (e) { finish(e as Error) }
+            })
+            return
           }
-        } catch (err) {
-          finish(err as Error)
-        }
+
+          // Skip other events while waiting for connect response
+          if (msg.type === 'event') return
+
+        } catch (err) { finish(err as Error) }
       })
 
-      ws.on('error', (err) => {
-        finish(new Error(`WebSocket error: ${err.message}`))
-      })
-
-      ws.on('close', () => {
-        if (!settled) {
-          settled = true
-          clearTimeout(timer)
-        }
-      })
+      ws.on('error', (err) => finish(new Error(`WS error: ${err.message}`)))
+      ws.on('close', () => { if (!settled) { settled = true; clearTimeout(timer) } })
     })
   }
 
-  /** 获取 gateway 健康状态 */
-  async health(): Promise<unknown> {
-    return this.rpc('health', {})
+  async health() { return this.rpc<any>('health', {}) }
+
+  async listSessions(limit = 50) {
+    return this.rpc<any>('sessions.list', { limit, includeGlobal: true, includeUnknown: true })
   }
 
-  /** 获取所有会话列表 */
-  async listSessions(limit = 50): Promise<unknown> {
-    return this.rpc('sessions.list', {
-      limit,
-      includeGlobal: true,
-      includeUnknown: true,
-    })
+  async getChatHistory(sessionKey: string, limit = 200) {
+    return this.rpc<any>('chat.history', { sessionKey, limit })
   }
 
-  /** 获取某个会话的聊天历史 */
-  async getChatHistory(sessionKey: string, limit = 200): Promise<{ messages: Array<{ role: string; content: unknown; timestamp?: number }> }> {
-    return this.rpc('chat.history', { sessionKey, limit })
-  }
+  async listModels() { return this.rpc<any>('models.list', {}) }
 
-  /** 获取可用模型列表 */
-  async listModels(): Promise<unknown> {
-    return this.rpc('models.list', {})
-  }
-
-  /** 获取 agent 身份信息 */
-  async getAgentIdentity(sessionKey?: string): Promise<unknown> {
-    return this.rpc('agent.identity.get', sessionKey ? { sessionKey } : {})
-  }
-
-  /**
-   * 统计对话数据
-   */
-  async getConversationStats(): Promise<{
-    totalSessions: number
-    sessions: Array<{
-      key: string
-      messageCount: number
-      userMessages: number
-      assistantMessages: number
-    }>
-    totalMessages: number
-    totalUserMessages: number
-    totalAssistantMessages: number
-  }> {
-    const result = await this.listSessions() as { sessions?: Array<{ key: string }> }
-    const sessionList = (result as any)?.sessions ?? (result as any)?.recent ?? []
+  async getConversationStats() {
+    const result = await this.listSessions()
+    const sessionList: any[] = result?.sessions ?? result?.recent ?? []
 
     const sessions = await Promise.all(
       sessionList.map(async (s: any) => {
@@ -177,10 +146,13 @@ export class AllyclawClient {
         if (!key) return { key: 'unknown', messageCount: 0, userMessages: 0, assistantMessages: 0 }
         try {
           const history = await this.getChatHistory(key)
-          const msgs = history?.messages ?? []
-          const userMessages = msgs.filter((m) => m.role === 'user').length
-          const assistantMessages = msgs.filter((m) => m.role === 'assistant').length
-          return { key, messageCount: msgs.length, userMessages, assistantMessages }
+          const msgs: any[] = history?.messages ?? []
+          return {
+            key,
+            messageCount: msgs.length,
+            userMessages: msgs.filter((m) => m.role === 'user').length,
+            assistantMessages: msgs.filter((m) => m.role === 'assistant').length,
+          }
         } catch {
           return { key, messageCount: 0, userMessages: 0, assistantMessages: 0 }
         }
@@ -188,9 +160,12 @@ export class AllyclawClient {
     )
 
     const totalMessages = sessions.reduce((sum, s) => sum + s.messageCount, 0)
-    const totalUserMessages = sessions.reduce((sum, s) => sum + s.userMessages, 0)
-    const totalAssistantMessages = sessions.reduce((sum, s) => sum + s.assistantMessages, 0)
-
-    return { totalSessions: sessions.length, sessions, totalMessages, totalUserMessages, totalAssistantMessages }
+    return {
+      totalSessions: sessions.length,
+      sessions,
+      totalMessages,
+      totalUserMessages: sessions.reduce((sum, s) => sum + s.userMessages, 0),
+      totalAssistantMessages: sessions.reduce((sum, s) => sum + s.assistantMessages, 0),
+    }
   }
 }
