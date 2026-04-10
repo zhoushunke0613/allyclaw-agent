@@ -50,7 +50,7 @@ export class ChatGPTAgent {
           const role = msg.role === 'user' ? 'user' as const : 'assistant' as const
           const content = typeof msg.content === 'string'
             ? msg.content
-            : (msg.content ?? []).filter(b => b.type === 'text').map(b => b.text ?? '').join('')
+            : (Array.isArray(msg.content) ? msg.content : []).filter((b: any) => b.type === 'text').map((b: any) => b.text ?? '').join('')
           if (content) {
             historyMessages.push({ role, content })
           }

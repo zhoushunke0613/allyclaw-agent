@@ -2,53 +2,23 @@
  * Allyclaw (OpenClaw) Gateway Client
  * Connects via WebSocket RPC to the OpenClaw gateway
  *
- * RPC methods discovered from the Control UI:
- *   sessions.list   — list all conversation sessions
- *   chat.history    — get message history for a session
- *   chat.send       — send a message in a session
- *   health          — gateway health check
- *   models.list     — list available models
+ * Auth flow:
+ *   1. Connect WebSocket
+ *   2. Receive connect.challenge { nonce }
+ *   3. Reply with connect.auth { token, nonce, clientName, mode }
+ *   4. Receive hello event → authenticated
+ *   5. Send RPC requests
  */
 
 import WebSocket from 'ws'
 
 export interface AllyclawConfig {
-  /** WebSocket URL, e.g. ws://43.166.252.204:12369 */
+  /** WebSocket URL, e.g. ws://localhost:12369 */
   gatewayUrl: string
   /** Auth token from openclaw.json gateway.auth.token */
   token: string
   /** Request timeout in ms (default: 15000) */
   timeout?: number
-}
-
-export interface Session {
-  key: string
-  kind: string
-  model: string
-  tokens: number
-  contextPercent: number
-  age: string
-  flags: string
-}
-
-export interface ChatMessage {
-  role: 'user' | 'assistant' | 'system'
-  content: string | Array<{ type: string; text?: string }>
-  timestamp?: number
-}
-
-export interface HealthResult {
-  ok: boolean
-  ts: number
-  durationMs: number
-  heartbeatSeconds: number
-  defaultAgentId: string
-  agents: unknown[]
-  sessions: {
-    path: string
-    count: number
-    recent: unknown[]
-  }
 }
 
 export class AllyclawClient {
@@ -63,92 +33,118 @@ export class AllyclawClient {
   }
 
   /**
-   * Send a JSON-RPC request to the OpenClaw gateway via WebSocket.
-   * Opens a short-lived connection, sends the request, and returns the response.
+   * Open a WebSocket connection, complete challenge-response auth,
+   * then send an RPC request and return the result.
    */
-  private async rpc<T>(method: string, params: unknown = {}): Promise<T> {
+  private rpc<T>(method: string, params: unknown = {}): Promise<T> {
     return new Promise((resolve, reject) => {
       const wsUrl = this.gatewayUrl.replace(/^http/, 'ws')
       const ws = new WebSocket(wsUrl)
+      let settled = false
+      let authenticated = false
+      let rpcId = 1
+
       const timer = setTimeout(() => {
-        ws.close()
-        reject(new Error(`RPC timeout after ${this.timeout}ms for method: ${method}`))
+        if (!settled) {
+          settled = true
+          ws.close()
+          reject(new Error(`RPC timeout after ${this.timeout}ms for method: ${method}`))
+        }
       }, this.timeout)
 
+      const finish = (err: Error | null, result?: T) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        if (err) reject(err)
+        else resolve(result as T)
+        ws.close()
+      }
+
       ws.on('open', () => {
-        ws.send(JSON.stringify({
-          id: 1,
-          method,
-          params,
-          token: this.token,
-        }))
+        // Wait for challenge from gateway
       })
 
       ws.on('message', (data: WebSocket.Data) => {
-        clearTimeout(timer)
+        if (settled) return
         try {
           const msg = JSON.parse(data.toString())
-          // The gateway sends a "hello" message first, then our RPC response
-          if (msg.event === 'hello' || msg.type === 'hello') {
-            // Wait for the actual RPC response
+
+          // Step 1: Handle challenge → send auth
+          if (msg.event === 'connect.challenge' || msg.type === 'connect.challenge') {
+            const nonce = msg.payload?.nonce ?? msg.nonce
+            ws.send(JSON.stringify({
+              type: 'connect.auth',
+              token: this.token,
+              nonce,
+              clientName: 'allyclaw-agent',
+              clientVersion: '1.0.0',
+              mode: 'webchat',
+            }))
             return
           }
-          if (msg.error) {
-            reject(new Error(`RPC error (${method}): ${msg.error.message || JSON.stringify(msg.error)}`))
-          } else {
-            resolve((msg.result ?? msg.data ?? msg) as T)
+
+          // Step 2: Hello → authenticated, now send RPC
+          if (msg.event === 'hello' || msg.type === 'hello') {
+            authenticated = true
+            ws.send(JSON.stringify({
+              id: rpcId,
+              method,
+              params,
+            }))
+            return
           }
-          ws.close()
+
+          // Step 3: Handle RPC response
+          if (authenticated) {
+            // Skip other events (agent, chat, presence, etc.)
+            if (msg.event && msg.id === undefined) return
+
+            if (msg.error) {
+              finish(new Error(`RPC error (${method}): ${msg.error.message || JSON.stringify(msg.error)}`))
+            } else {
+              finish(null, (msg.result ?? msg.data ?? msg) as T)
+            }
+          }
         } catch (err) {
-          reject(err)
-          ws.close()
+          finish(err as Error)
         }
       })
 
       ws.on('error', (err) => {
-        clearTimeout(timer)
-        reject(new Error(`WebSocket error: ${err.message}`))
+        finish(new Error(`WebSocket error: ${err.message}`))
       })
 
       ws.on('close', () => {
-        clearTimeout(timer)
+        if (!settled) {
+          settled = true
+          clearTimeout(timer)
+        }
       })
     })
   }
 
   /** 获取 gateway 健康状态 */
-  async health(): Promise<HealthResult> {
-    return this.rpc<HealthResult>('health', {})
+  async health(): Promise<unknown> {
+    return this.rpc('health', {})
   }
 
   /** 获取所有会话列表 */
-  async listSessions(params?: { limit?: number; includeGlobal?: boolean }): Promise<unknown> {
+  async listSessions(limit = 50): Promise<unknown> {
     return this.rpc('sessions.list', {
-      limit: params?.limit ?? 50,
-      includeGlobal: params?.includeGlobal ?? true,
+      limit,
+      includeGlobal: true,
       includeUnknown: true,
     })
   }
 
   /** 获取某个会话的聊天历史 */
-  async getChatHistory(sessionKey: string, limit = 200): Promise<{ messages: ChatMessage[] }> {
-    return this.rpc('chat.history', {
-      sessionKey,
-      limit,
-    })
-  }
-
-  /** 发送消息到某个会话 */
-  async sendMessage(sessionKey: string, message: string): Promise<unknown> {
-    return this.rpc('chat.send', {
-      sessionKey,
-      message,
-      deliver: false,
-    })
+  async getChatHistory(sessionKey: string, limit = 200): Promise<{ messages: Array<{ role: string; content: unknown; timestamp?: number }> }> {
+    return this.rpc('chat.history', { sessionKey, limit })
   }
 
   /** 获取可用模型列表 */
-  async listModels(): Promise<{ models: unknown[] }> {
+  async listModels(): Promise<unknown> {
     return this.rpc('models.list', {})
   }
 
@@ -159,37 +155,42 @@ export class AllyclawClient {
 
   /**
    * 统计对话数据
-   * 汇总所有 session 的消息数量、token 使用等
    */
   async getConversationStats(): Promise<{
     totalSessions: number
     sessions: Array<{
       key: string
       messageCount: number
-      messages: ChatMessage[]
+      userMessages: number
+      assistantMessages: number
     }>
+    totalMessages: number
+    totalUserMessages: number
+    totalAssistantMessages: number
   }> {
-    const sessionsResult = await this.listSessions() as { sessions?: Array<{ key: string }> }
-    const sessions = sessionsResult?.sessions ?? []
+    const result = await this.listSessions() as { sessions?: Array<{ key: string }> }
+    const sessionList = (result as any)?.sessions ?? (result as any)?.recent ?? []
 
-    const stats = await Promise.all(
-      sessions.map(async (s) => {
+    const sessions = await Promise.all(
+      sessionList.map(async (s: any) => {
+        const key = s.key ?? s.sessionKey ?? s.id ?? ''
+        if (!key) return { key: 'unknown', messageCount: 0, userMessages: 0, assistantMessages: 0 }
         try {
-          const history = await this.getChatHistory(s.key)
-          return {
-            key: s.key,
-            messageCount: history.messages?.length ?? 0,
-            messages: history.messages ?? [],
-          }
+          const history = await this.getChatHistory(key)
+          const msgs = history?.messages ?? []
+          const userMessages = msgs.filter((m) => m.role === 'user').length
+          const assistantMessages = msgs.filter((m) => m.role === 'assistant').length
+          return { key, messageCount: msgs.length, userMessages, assistantMessages }
         } catch {
-          return { key: s.key, messageCount: 0, messages: [] }
+          return { key, messageCount: 0, userMessages: 0, assistantMessages: 0 }
         }
       })
     )
 
-    return {
-      totalSessions: sessions.length,
-      sessions: stats,
-    }
+    const totalMessages = sessions.reduce((sum, s) => sum + s.messageCount, 0)
+    const totalUserMessages = sessions.reduce((sum, s) => sum + s.userMessages, 0)
+    const totalAssistantMessages = sessions.reduce((sum, s) => sum + s.assistantMessages, 0)
+
+    return { totalSessions: sessions.length, sessions, totalMessages, totalUserMessages, totalAssistantMessages }
   }
 }
