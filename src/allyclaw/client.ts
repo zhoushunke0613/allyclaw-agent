@@ -82,32 +82,34 @@ export class AllyclawClient {
           }
 
           // Responses (matched by id)
+          // Responses matched by id (type: "res")
           if (msg.id === connectId) {
-            // Step 2: connect response → send actual RPC
-            if (msg.error) {
-              finish(new Error(`Connect failed: ${JSON.stringify(msg.error)}`))
+            if (!msg.ok || msg.error) {
+              finish(new Error(`Connect failed: ${JSON.stringify(msg.error ?? msg.payload)}`))
             } else {
+              // Auth OK → send actual RPC
               ws.send(JSON.stringify({ type: 'req', id: rpcId, method, params }))
             }
             return
           }
 
           if (msg.id === rpcId) {
-            // Step 3: RPC response
-            if (msg.error) {
-              finish(new Error(`RPC error (${method}): ${JSON.stringify(msg.error)}`))
+            if (!msg.ok || msg.error) {
+              finish(new Error(`RPC error (${method}): ${JSON.stringify(msg.error ?? msg.payload)}`))
             } else {
-              finish(null, (msg.result ?? msg) as T)
+              finish(null, (msg.payload ?? msg.result ?? msg) as T)
             }
             return
           }
 
-          // Ignore other messages (different ids, etc.)
+          // Ignore other messages
         } catch (err) { finish(err as Error) }
       })
 
       ws.on('error', (err) => finish(new Error(`WS error: ${err.message}`)))
-      ws.on('close', () => { if (!settled) { settled = true; clearTimeout(timer) } })
+      ws.on('close', () => {
+        if (!settled) { settled = true; clearTimeout(timer); reject(new Error('WS closed before response')) }
+      })
     })
   }
 

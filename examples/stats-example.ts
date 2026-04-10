@@ -1,8 +1,8 @@
 /**
- * Allyclaw (OpenClaw) Conversation Statistics — Example
+ * Allyclaw (OpenClaw) Conversation Statistics
  *
  * Usage:
- *   cp .env.example .env   # fill in your gateway URL & token
+ *   cp .env.example .env   # fill in gateway URL & token
  *   npm run example:stats
  */
 
@@ -12,64 +12,36 @@ import { createAllyclawClient } from '../src/index.js'
 async function main() {
   const client = createAllyclawClient()
 
-  // --- 1. Health check ---
-  console.log('=== Gateway Health ===')
-  try {
-    const health = await client.health()
-    console.log(`Status: ${health.ok ? '✅ OK' : '❌ Error'}`)
-    console.log(`Sessions: ${health.sessions?.count ?? 'N/A'}`)
-    console.log(`Agents: ${health.agents?.length ?? 0}`)
-  } catch (err) {
-    console.error('Health check failed:', err)
+  // --- 1. List sessions ---
+  console.log('=== Sessions ===')
+  const result = await client.listSessions(50)
+  const sessions: any[] = result?.sessions ?? []
+  console.log(`Found ${sessions.length} sessions\n`)
+
+  for (const s of sessions) {
+    const key = s.key ?? 'unknown'
+    const model = s.model ?? '-'
+    const tokens = s.tokenCount ?? '-'
+    const ctx = s.contextTokens ?? '-'
+    console.log(`  ${key}`)
+    console.log(`    model: ${model}, tokens: ${tokens}/${ctx}`)
   }
 
-  // --- 2. List all sessions ---
-  console.log('\n=== All Sessions ===')
-  const sessions = await client.listSessions({ limit: 50 })
-  console.log(JSON.stringify(sessions, null, 2))
-
-  // --- 3. Conversation statistics ---
-  console.log('\n=== Conversation Statistics ===')
+  // --- 2. Per-session message counts ---
+  console.log('\n=== Message Counts ===')
   const stats = await client.getConversationStats()
-  console.log(`Total sessions: ${stats.totalSessions}`)
 
   for (const s of stats.sessions) {
-    console.log(`\n  Session: ${s.key}`)
-    console.log(`  Messages: ${s.messageCount}`)
-
-    // Count by role
-    const userMsgs = s.messages.filter(m => m.role === 'user').length
-    const assistantMsgs = s.messages.filter(m => m.role === 'assistant').length
-    console.log(`    User messages: ${userMsgs}`)
-    console.log(`    Assistant messages: ${assistantMsgs}`)
+    console.log(`  ${s.key}: ${s.messageCount} msgs (user: ${s.userMessages}, assistant: ${s.assistantMessages})`)
   }
 
-  // --- 4. Summary ---
-  const totalMessages = stats.sessions.reduce((sum, s) => sum + s.messageCount, 0)
-  const totalUserMsgs = stats.sessions.reduce(
-    (sum, s) => sum + s.messages.filter(m => m.role === 'user').length, 0
-  )
-  const totalAssistantMsgs = stats.sessions.reduce(
-    (sum, s) => sum + s.messages.filter(m => m.role === 'assistant').length, 0
-  )
-
+  // --- 3. Summary ---
   console.log('\n=== Summary ===')
   console.log(`Total sessions:           ${stats.totalSessions}`)
-  console.log(`Total messages:           ${totalMessages}`)
-  console.log(`  User messages:          ${totalUserMsgs}`)
-  console.log(`  Assistant messages:     ${totalAssistantMsgs}`)
-  console.log(`Avg messages per session: ${stats.totalSessions ? (totalMessages / stats.totalSessions).toFixed(1) : 0}`)
-
-  // --- 5. Available models ---
-  console.log('\n=== Available Models ===')
-  try {
-    const models = await client.listModels()
-    for (const m of models.models ?? []) {
-      console.log(`  - ${JSON.stringify(m)}`)
-    }
-  } catch {
-    console.log('  (could not fetch models)')
-  }
+  console.log(`Total messages:           ${stats.totalMessages}`)
+  console.log(`  User messages:          ${stats.totalUserMessages}`)
+  console.log(`  Assistant messages:     ${stats.totalAssistantMessages}`)
+  console.log(`Avg messages/session:     ${stats.totalSessions ? (stats.totalMessages / stats.totalSessions).toFixed(1) : 0}`)
 }
 
 main().catch(console.error)
