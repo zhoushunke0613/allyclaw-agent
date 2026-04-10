@@ -37,7 +37,8 @@ export class AllyclawClient {
   private rpc<T>(method: string, params: unknown = {}): Promise<T> {
     return new Promise((resolve, reject) => {
       const wsUrl = this.gatewayUrl.replace(/^http/, 'ws')
-      const ws = new WebSocket(wsUrl)
+      const httpUrl = this.gatewayUrl.replace(/^ws/, 'http')
+      const ws = new WebSocket(wsUrl, { headers: { Origin: httpUrl } })
       let settled = false
       let authenticated = false
       const connectId = randomUUID()
