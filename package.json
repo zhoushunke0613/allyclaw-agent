@@ -1,0 +1,27 @@
+{
+  "name": "allyclaw-agent",
+  "version": "1.0.0",
+  "description": "Allyclaw AI Agent — integrate ChatGPT & Claude with OpenClaw Gateway for user conversation statistics",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "example:chatgpt": "tsx examples/chatgpt-example.ts",
+    "example:claude": "tsx examples/claude-example.ts",
+    "example:stats": "tsx examples/stats-example.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "openai": "^4.87.0",
+    "dotenv": "^16.4.7",
+    "uuid": "^11.1.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/uuid": "^10.0.0",
+    "@types/ws": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
