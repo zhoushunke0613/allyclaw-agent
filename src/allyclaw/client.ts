@@ -69,7 +69,7 @@ export class AllyclawClient {
                 minProtocol: 3,
                 maxProtocol: 3,
                 client: {
-                  id: 'allyclaw-agent',
+                  id: 'openclaw-control-ui',
                   version: '1.0.0',
                   platform: 'linux',
                   mode: 'webchat',
@@ -79,7 +79,6 @@ export class AllyclawClient {
                 auth: { token: this.token },
                 role: 'operator',
                 scopes: ['operator.admin', 'operator.read'],
-                nonce,
               },
             }))
             return
